@@ -1,0 +1,61 @@
+name: sync-upstream
+# Put this workflow in YOUR forked preflate-rs repo.
+# It checks weekly for new upstream releases, applies the 3 raw-format patches,
+# runs tests, and pushes a `vX.Y.Z-raw` tag.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - run: |
+          git remote add upstream https://github.com/microsoft/preflate-rs.git
+          git fetch upstream --tags
+
+      - id: check
+        run: |
+          # Sort upstream tags by version, pick the latest
+          UPSTREAM=$(git tag -l 'v*' --sort=-version:refname | grep '^v[0-9]' | head -1)
+          OUR="${UPSTREAM}-raw"
+          echo "upstream=$UPSTREAM our=$OUR"
+          if git rev-parse "$OUR" >/dev/null 2>&1; then
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+            echo "Already synced: $OUR"
+          else
+            echo "upstream=$UPSTREAM" >> "$GITHUB_OUTPUT"
+            echo "our=$OUR" >> "$GITHUB_OUTPUT"
+            echo "Syncing $UPSTREAM → $OUR"
+          fi
+
+      - name: apply patches onto new upstream tag
+        if: steps.check.outputs.skip != '1'
+        run: |
+          cp -r patches /tmp/rawflate-patches
+          git checkout "${{ steps.check.outputs.upstream }}"
+          for patch in /tmp/rawflate-patches/*.patch; do
+            echo "Applying $patch ..."
+            git apply "$patch" || { echo "::error::patch $patch failed — manual intervention required"; exit 1; }
+          done
+
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p preflate-container
+        if: steps.check.outputs.skip != '1'
+
+      - name: commit, tag, and push
+        if: steps.check.outputs.skip != '1'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "sync: apply raw-format patches on ${{ steps.check.outputs.upstream }}"
+          git tag "${{ steps.check.outputs.our }}"
+          git branch -f raw-format HEAD
+          git push origin "${{ steps.check.outputs.our }}" raw-format --force
