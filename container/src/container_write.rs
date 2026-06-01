@@ -30,6 +30,26 @@ impl Write for MeasureWriteSink {
     }
 }
 
+pub(crate) enum BlockBuf {
+    Zstd(zstd::stream::write::Encoder<'static, Vec<u8>>),
+    Raw(Vec<u8>),
+}
+
+impl Write for BlockBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            BlockBuf::Zstd(enc) => enc.write(buf),
+            BlockBuf::Raw(vec) => vec.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            BlockBuf::Zstd(enc) => enc.flush(),
+            BlockBuf::Raw(_) => Ok(()),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum ChunkParseState {
     Start,
@@ -45,21 +65,21 @@ pub(crate) enum ChunkParseState {
 /// JPEG blocks are written raw to writer (bypass encoder).
 /// Returns (total compressed bytes written, optional continue state).
 pub(crate) fn write_chunk_block_v2(
-    encoder: &mut zstd::stream::write::Encoder<'static, Vec<u8>>,
+    block_buf: &mut BlockBuf,
     writer: &mut impl Write,
     chunk: FoundStream,
     stats: &mut PreflateStats,
 ) -> Result<(usize, Option<PreflateStreamProcessor>)> {
     match chunk.chunk_type {
         FoundStreamType::DeflateStream(parameters, state) => {
-            write_varint(encoder, chunk.corrections.len() as u32)?;
-            write_varint(encoder, state.plain_text().text().len() as u32)?;
-            encoder.write_all(&chunk.corrections)?;
-            encoder.write_all(&state.plain_text().text())?;
+            write_varint(block_buf, chunk.corrections.len() as u32)?;
+            write_varint(block_buf, state.plain_text().text().len() as u32)?;
+            block_buf.write_all(&chunk.corrections)?;
+            block_buf.write_all(&state.plain_text().text())?;
 
             let compressed_size = emit_compressed_block(
                 BLOCK_COMPRESSION_ZSTD | BLOCK_TYPE_DEFLATE,
-                encoder,
+                block_buf,
                 writer,
             )?;
 
@@ -98,16 +118,16 @@ pub(crate) fn write_chunk_block_v2(
             } else {
                 // Non-WebP PNG: corrections + plaintext are compressible, send through Zstd.
                 log::debug!("non-Webp compressed {}", idat.total_chunk_length);
-                write_varint(encoder, chunk.corrections.len() as u32)?;
-                write_varint(encoder, plain_text.text().len() as u32)?;
+                write_varint(block_buf, chunk.corrections.len() as u32)?;
+                write_varint(block_buf, plain_text.text().len() as u32)?;
                 idat.png_header = None;
-                idat.write_to_bytestream(encoder)?;
-                encoder.write_all(&chunk.corrections)?;
-                encoder.write_all(plain_text.text())?;
+                idat.write_to_bytestream(block_buf)?;
+                block_buf.write_all(&chunk.corrections)?;
+                block_buf.write_all(plain_text.text())?;
 
                 let compressed_size = emit_compressed_block(
                     BLOCK_COMPRESSION_ZSTD | BLOCK_TYPE_PNG,
-                    encoder,
+                    block_buf,
                     writer,
                 )?;
 
@@ -155,8 +175,8 @@ pub struct PreflateContainerProcessor {
     /// running CRC-32 of all input bytes, written as the final block
     input_crc: CrcHasher,
 
-    /// each block is individually compressed with this encoder (v2 format)
-    encoder: Option<zstd::stream::write::Encoder<'static, Vec<u8>>>,
+    /// per-block output buffer (Zstd encoder or raw Vec in no_zstd mode)
+    block_buf: BlockBuf,
 
     /// when present, all raw input is also fed to this encoder so we can measure
     /// baseline Zstd compression (without preflate processing)
@@ -167,6 +187,11 @@ impl PreflateContainerProcessor {
     /// Creates a processor that uses v2 format with a persistent Zstd encoder shared
     /// across all non-JPEG blocks. JPEG blocks bypass the encoder entirely.
     pub fn new(config: &PreflateContainerConfig, level: i32, test_baseline: bool) -> Self {
+        let block_buf = if config.no_zstd {
+            BlockBuf::Raw(Vec::new())
+        } else {
+            BlockBuf::Zstd(zstd::stream::write::Encoder::new(Vec::new(), level).unwrap())
+        };
         PreflateContainerProcessor {
             content: Vec::new(),
             compression_stats: PreflateStats::default(),
@@ -176,7 +201,7 @@ impl PreflateContainerProcessor {
             last_attempt_chunk_size: 0,
             config: config.clone(),
             input_crc: CrcHasher::new(),
-            encoder: Some(zstd::stream::write::Encoder::new(Vec::new(), level).unwrap()),
+            block_buf,
             baseline_encoder: if test_baseline {
                 Some(
                     zstd::stream::write::Encoder::new(MeasureWriteSink { length: 0 }, level)
@@ -211,7 +236,7 @@ impl ProcessBuffer for PreflateContainerProcessor {
             self.content.extend_from_slice(input);
 
             if let Some(encoder) = &mut self.baseline_encoder {
-                encoder.write_all(input).context()?;
+                self.block_buf.write_all(input).context()?;
             }
         }
 
@@ -236,12 +261,11 @@ impl ProcessBuffer for PreflateContainerProcessor {
                 ChunkParseState::Searching(prev_ihdr) => {
                     if self.total_plain_text_seen > self.config.total_plain_text_limit {
                         // once we've exceeded our limit, we don't do any more compression
-                        let encoder = self.encoder.as_mut().unwrap();
-                        write_varint(encoder, self.content.len() as u32)?;
-                        encoder.write_all(&self.content)?;
+                        write_varint(&mut self.block_buf, self.content.len() as u32)?;
+                        self.block_buf.write_all(&self.content)?;
                         let sz = emit_compressed_block(
                             BLOCK_COMPRESSION_ZSTD | BLOCK_TYPE_LITERAL,
-                            encoder,
+                            &mut self.block_buf,
                             writer,
                         )?;
                         self.compression_stats.zstd_compressed_size += sz as u64;
@@ -262,19 +286,18 @@ impl ProcessBuffer for PreflateContainerProcessor {
                             // the gap between the start and the beginning of the deflate stream
                             // is written out as a literal block
                             if next.start != 0 {
-                                let encoder = self.encoder.as_mut().unwrap();
-                                write_varint(encoder, next.start as u32)?;
-                                encoder.write_all(&self.content[..next.start])?;
+                                write_varint(&mut self.block_buf, next.start as u32)?;
+                                self.block_buf.write_all(&self.content[..next.start])?;
                                 let sz = emit_compressed_block(
                                     BLOCK_COMPRESSION_ZSTD | BLOCK_TYPE_LITERAL,
-                                    encoder,
+                                    &mut self.block_buf,
                                     writer,
                                 )?;
                                 self.compression_stats.zstd_compressed_size += sz as u64;
                             }
 
                             let (compressed_size, next_state) = write_chunk_block_v2(
-                                self.encoder.as_mut().unwrap(),
+                                &mut self.block_buf,
                                 writer,
                                 chunk,
                                 &mut self.compression_stats,
@@ -295,12 +318,11 @@ impl ProcessBuffer for PreflateContainerProcessor {
                             if input_complete || self.content.len() > self.config.max_chunk_size {
                                 // if we have too much data or have no more data,
                                 // we just write it out as a literal block with everything we have
-                                let encoder = self.encoder.as_mut().unwrap();
-                                write_varint(encoder, self.content.len() as u32)?;
-                                encoder.write_all(&self.content)?;
+                                write_varint(&mut self.block_buf, self.content.len() as u32)?;
+                                self.block_buf.write_all(&self.content)?;
                                 let sz = emit_compressed_block(
                                     BLOCK_COMPRESSION_ZSTD | BLOCK_TYPE_LITERAL,
-                                    encoder,
+                                    &mut self.block_buf,
                                     writer,
                                 )?;
                                 self.compression_stats.zstd_compressed_size += sz as u64;
@@ -315,12 +337,11 @@ impl ProcessBuffer for PreflateContainerProcessor {
                         }
                         FindStreamResult::None => {
                             // couldn't find anything, just write the rest as a literal block
-                            let encoder = self.encoder.as_mut().unwrap();
-                            write_varint(encoder, self.content.len() as u32)?;
-                            encoder.write_all(&self.content)?;
+                            write_varint(&mut self.block_buf, self.content.len() as u32)?;
+                            self.block_buf.write_all(&self.content)?;
                             let sz = emit_compressed_block(
                                 BLOCK_COMPRESSION_ZSTD | BLOCK_TYPE_LITERAL,
-                                encoder,
+                                &mut self.block_buf,
                                 writer,
                             )?;
                             self.compression_stats.zstd_compressed_size += sz as u64;
@@ -355,14 +376,13 @@ impl ProcessBuffer for PreflateContainerProcessor {
                                 res.compressed_size
                             );
 
-                            let encoder = self.encoder.as_mut().unwrap();
-                            write_varint(encoder, res.corrections.len() as u32)?;
-                            write_varint(encoder, state.plain_text().len() as u32)?;
-                            encoder.write_all(&res.corrections)?;
-                            encoder.write_all(&state.plain_text().text())?;
+                            write_varint(&mut self.block_buf, res.corrections.len() as u32)?;
+                            write_varint(&mut self.block_buf, state.plain_text().len() as u32)?;
+                            self.block_buf.write_all(&res.corrections)?;
+                            self.block_buf.write_all(&state.plain_text().text())?;
                             let sz = emit_compressed_block(
                                 BLOCK_COMPRESSION_ZSTD | BLOCK_TYPE_DEFLATE_CONTINUE,
-                                encoder,
+                                &mut self.block_buf,
                                 writer,
                             )?;
                             self.compression_stats.zstd_compressed_size += sz as u64;
@@ -390,22 +410,18 @@ impl ProcessBuffer for PreflateContainerProcessor {
             self.input_complete = true;
 
             if self.content.len() > 0 {
-                let encoder = self.encoder.as_mut().unwrap();
-                write_varint(encoder, self.content.len() as u32)?;
-                encoder.write_all(&self.content)?;
+                write_varint(&mut self.block_buf, self.content.len() as u32)?;
+                self.block_buf.write_all(&self.content)?;
                 let sz = emit_compressed_block(
                     BLOCK_COMPRESSION_ZSTD | BLOCK_TYPE_LITERAL,
-                    encoder,
+                    &mut self.block_buf,
                     writer,
                 )?;
                 self.compression_stats.zstd_compressed_size += sz as u64;
             }
             self.content.clear();
 
-            // Finalize the Zstd encoder; finish bytes are discarded since each block
-            // was already flushed and the decoder relies on EOF as the stream terminator.
-            let encoder = self.encoder.take().unwrap();
-            let _ = encoder.finish();
+            // BlockBuf is dropped naturally — no explicit Zstd finish needed.
 
             // Write the CRC-32 end block: 0xFF sentinel + 4-byte LE CRC of original input.
             let crc = self.input_crc.clone().finalize();
@@ -428,21 +444,34 @@ impl ProcessBuffer for PreflateContainerProcessor {
     }
 }
 
-/// Flushes the encoder, writes [block_type][varint(compressed_size)][compressed_bytes] to
-/// destination, clears the encoder's inner buffer, and returns the compressed byte count.
+/// Flushes the &mut self.block_buf, writes [block_type][varint(size)][bytes] to
+/// destination, clears the inner buffer, and returns the byte count.
 fn emit_compressed_block(
     block_type: u8,
-    encoder: &mut zstd::stream::write::Encoder<'static, Vec<u8>>,
+    block_buf: &mut BlockBuf,
     destination: &mut impl Write,
 ) -> Result<usize> {
-    encoder.flush().context()?;
-    let compressed = encoder.get_mut();
-    let len = compressed.len();
-    destination.write_all(&[block_type])?;
-    write_varint(destination, len as u32)?;
-    destination.write_all(compressed)?;
-    compressed.clear();
-    Ok(len)
+    match block_buf {
+        BlockBuf::Zstd(enc) => {
+            enc.flush().context()?;
+            let compressed = enc.get_mut();
+            let len = compressed.len();
+            destination.write_all(&[block_type])?;
+            write_varint(destination, len as u32)?;
+            destination.write_all(compressed)?;
+            compressed.clear();
+            Ok(len)
+        }
+        BlockBuf::Raw(vec) => {
+            let raw_type = block_type & !BLOCK_COMPRESSION_ZSTD;
+            destination.write_all(&[raw_type])?;
+            write_varint(destination, vec.len() as u32)?;
+            destination.write_all(vec)?;
+            let len = vec.len();
+            vec.clear();
+            Ok(len)
+        }
+    }
 }
 
 fn webp_compress(
