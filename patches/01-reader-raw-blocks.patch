@@ -1,0 +1,58 @@
+diff --git a/container/src/container_read.rs b/container/src/container_read.rs
+index 795382a..6fd26f7 100644
+--- a/container/src/container_read.rs
++++ b/container/src/container_read.rs
+@@ -45,6 +45,7 @@ enum DecompressionState {
+     /// accumulate compressed_size bytes then decode and process the block immediately.
+     AccumulateBlock {
+         block_type: u8,
++        compression: u8,
+         compressed_size: usize,
+     },
+     /// accumulate lepton bytes then decode the JPEG block immediately.
+@@ -225,15 +226,20 @@ impl RecreateContainerProcessor {
+                                     let total_len = read_varint(r)? as usize;
+                                     Ok(DecompressionState::WebpAccumulate { total_len })
+                                 }
+-                                _ => err_exit_code(
+-                                    ExitCode::InvalidCompressedWrapper,
+-                                    "unknown raw block type",
+-                                ),
++                                _ => {
++                                    let raw_size = read_varint(r)? as usize;
++                                    Ok(DecompressionState::AccumulateBlock {
++                                        block_type,
++                                        compression: BLOCK_COMPRESSION_NONE,
++                                        compressed_size: raw_size,
++                                    })
++                                }
+                             },
+                             BLOCK_COMPRESSION_ZSTD => {
+                                 let compressed_size = read_varint(r)? as usize;
+                                 Ok(DecompressionState::AccumulateBlock {
+                                     block_type,
++                                    compression: BLOCK_COMPRESSION_ZSTD,
+                                     compressed_size,
+                                 })
+                             }
+@@ -256,6 +262,7 @@ impl RecreateContainerProcessor {
+ 
+                 DecompressionState::AccumulateBlock {
+                     block_type,
++                    compression,
+                     compressed_size,
+                 } => {
+                     if self.input.len() < *compressed_size {
+@@ -270,7 +277,11 @@ impl RecreateContainerProcessor {
+ 
+                     let block_type = *block_type;
+                     let compressed_bytes: Vec<u8> = self.input.drain(0..*compressed_size).collect();
+-                    let decoded = drain_zstd_block(&mut self.zstd_decoder, &compressed_bytes)?;
++                    let decoded = if *compression == BLOCK_COMPRESSION_NONE {
++                        compressed_bytes
++                    } else {
++                        drain_zstd_block(&mut self.zstd_decoder, &compressed_bytes)?
++                    };
+                     process_compressed_block(
+                         block_type,
+                         &mut Cursor::new(decoded),
